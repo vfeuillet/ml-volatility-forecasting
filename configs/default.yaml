@@ -1,0 +1,16 @@
+data:
+  start: "2005-01-01"
+  end: "2025-12-31"          # inclusive
+  cache_dir: "data/raw"
+  benchmark: "SPY"
+  tickers: [SPY, AAPL, MSFT, INTC, CSCO, GOOGL, AMZN, HD, MCD, PG, KO, WMT,
+            JPM, BAC, GS, XOM, CVX, JNJ, PFE, UNH, CAT, BA, NEE]
+  vix: "^VIX"
+  risk_free: "^IRX"
+
+target:
+  horizon: 5                 # trading days
+  annualization: 252
+  variance_floor: 1.0e-8     # daily variance floor (GK can be slightly negative)
+
+seed: 42
