@@ -14,3 +14,7 @@ target:
   variance_floor: 1.0e-8     # daily variance floor (GK can be slightly negative)
 
 seed: 42
+
+walkforward:
+  test_start: "2012-01-01"
+  refit_every: 21            # trading days between re-estimations

@@ -1,16 +1,25 @@
 """End-to-end pipeline: `python scripts/run_all.py` (add --force to re-download)."""
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 
 import numpy as np
 import pandas as pd
 
 from volforecast.config import PROJECT_ROOT, load_config
 from volforecast.data import load_close, load_universe
+from volforecast.evaluation import common_sample, metrics_by_ticker, universe_summary
+from volforecast.features import har_features
+from volforecast.models.garch import garch_forecast
+from volforecast.models.har import HAR
+from volforecast.models.naive import naive_forecast
 from volforecast.plots import target_vs_vix
 from volforecast.targets import build_targets, variance_components
+from volforecast.walkforward import make_splits, run_supervised
 
 PROCESSED = PROJECT_ROOT / "data" / "processed"
+PREDICTIONS = PROJECT_ROOT / "results" / "predictions"
 TABLES = PROJECT_ROOT / "reports" / "tables"
 FIGURES = PROJECT_ROOT / "reports" / "figures"
 
@@ -45,7 +54,54 @@ def data_stage(cfg: dict, force: bool) -> pd.DataFrame:
 
     spy = targets.xs(cfg["data"]["benchmark"], level="ticker")["target_rv"]
     target_vs_vix(spy, vix, FIGURES / "spy_target_vs_vix.png")
-    return targets
+    return panel, targets
+
+
+def _benchmarks_one_ticker(item, cfg, splits):
+    """Naive, HAR, GARCH and GJR forecasts for one ticker (run in a worker process)."""
+    ticker, df, tgt = item
+    t = cfg["target"]
+    X = har_features(tgt["daily_var"], t["annualization"])
+    first_test = splits[0].test_dates[0]
+    out = pd.DataFrame({
+        "naive": naive_forecast(X)[lambda s: s.index >= first_test],
+        "har": run_supervised(HAR, X, tgt["target_log_rv"], splits),
+    })
+    n_failed = {}
+    for name, asym in (("garch", False), ("gjr", True)):
+        fc, n_failed[name] = garch_forecast(df["close"], splits, asym, t["horizon"], t["annualization"])
+        out[name] = fc
+    out["ticker"] = ticker
+    return out.set_index("ticker", append=True), {"ticker": ticker, **n_failed}
+
+
+def benchmark_stage(cfg: dict, panel: dict, targets: pd.DataFrame) -> pd.DataFrame:
+    calendar = panel[cfg["data"]["benchmark"]].index
+    w = cfg["walkforward"]
+    splits = make_splits(calendar, w["test_start"], w["refit_every"], cfg["target"]["horizon"])
+    items = [(tk, panel[tk], targets.xs(tk, level="ticker")) for tk in panel]
+    with ProcessPoolExecutor() as pool:
+        results = list(pool.map(partial(_benchmarks_one_ticker, cfg=cfg, splits=splits), items))
+    forecasts = pd.concat([r[0] for r in results]).sort_index()
+    failures = pd.DataFrame([r[1] for r in results]).set_index("ticker")
+    print(f"{len(splits)} refits per ticker; non-converged GARCH/GJR fits: "
+          f"{int(failures['garch'].sum())}/{int(failures['gjr'].sum())}")
+    PREDICTIONS.mkdir(parents=True, exist_ok=True)
+    for model in forecasts.columns:
+        forecasts[[model]].to_parquet(PREDICTIONS / f"{model}.parquet")
+    return forecasts
+
+
+def evaluation_stage(forecasts: pd.DataFrame, targets: pd.DataFrame) -> None:
+    models = list(forecasts.columns)
+    sample = common_sample(forecasts, targets["target_rv"] ** 2)
+    by_ticker = metrics_by_ticker(sample, models)
+    summary = universe_summary(by_ticker)
+    by_ticker.round(5).to_csv(TABLES / "metrics_by_ticker.csv")
+    summary.round(4).to_csv(TABLES / "metrics_universe.csv")
+    dates = sample.index.get_level_values("date")
+    print(f"\nCommon sample: {dates.min().date()} to {dates.max().date()}, {len(sample)} obs")
+    print(summary.round(4).to_string())
 
 
 def main() -> None:
@@ -53,7 +109,9 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="re-download raw data")
     args = parser.parse_args()
     cfg = load_config()
-    data_stage(cfg, args.force)
+    panel, targets = data_stage(cfg, args.force)
+    forecasts = benchmark_stage(cfg, panel, targets)
+    evaluation_stage(forecasts, targets)
 
 
 if __name__ == "__main__":
