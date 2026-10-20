@@ -18,3 +18,26 @@ seed: 42
 walkforward:
   test_start: "2012-01-01"
   refit_every: 21            # trading days between re-estimations
+
+gbm:
+  features: [log_rv_d, log_rv_w, log_rv_m, ret_1, ret_5, ret_22, abs_ret_1, abs_ret_5,
+             neg_ret_1, log_park_1, log_park_5, log_vix_lag, vix_chg_5_lag,
+             log_volume_ratio, log_overnight_5]
+  har_only_features: [log_rv_d, log_rv_w, log_rv_m]   # ablation
+  val_days: 252              # time-ordered validation set at the end of each training window
+  max_iter: 2000
+  n_iter_no_change: 20
+  # Chosen once by scripts/tune_gbm.py on 2009-2011 (never on the test period), then frozen.
+  params:                    # val QLIKE 0.2566 (grid range 0.2566-0.2743, see reports/tables/gbm_tuning.csv)
+    learning_rate: 0.1
+    max_leaf_nodes: 31
+    min_samples_leaf: 100
+    l2_regularization: 0.0
+  tuning:
+    train_end: "2008-12-31"
+    val_end: "2011-12-31"
+    grid:
+      learning_rate: [0.03, 0.1]
+      max_leaf_nodes: [15, 31]
+      min_samples_leaf: [100, 500]
+      l2_regularization: [0.0, 1.0]

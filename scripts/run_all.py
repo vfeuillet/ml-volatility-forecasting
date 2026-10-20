@@ -10,7 +10,8 @@ import pandas as pd
 from volforecast.config import PROJECT_ROOT, load_config
 from volforecast.data import load_close, load_universe
 from volforecast.evaluation import common_sample, metrics_by_ticker, universe_summary
-from volforecast.features import har_features
+from volforecast.features import har_features, pooled_dataset
+from volforecast.models.gbm import GBM
 from volforecast.models.garch import garch_forecast
 from volforecast.models.har import HAR
 from volforecast.models.naive import naive_forecast
@@ -92,6 +93,47 @@ def benchmark_stage(cfg: dict, panel: dict, targets: pd.DataFrame) -> pd.DataFra
     return forecasts
 
 
+def ml_stage(cfg: dict, panel: dict, targets: pd.DataFrame) -> pd.DataFrame:
+    """Pooled models: GBM (full features), plus two ablations (GBM on HAR features
+    only, and a single HAR estimated on all tickers at once)."""
+    calendar = panel[cfg["data"]["benchmark"]].index
+    vix = load_close(cfg["data"]["vix"], cfg, calendar)
+    w, g, h = cfg["walkforward"], cfg["gbm"], cfg["target"]["horizon"]
+    splits = make_splits(calendar, w["test_start"], w["refit_every"], h)
+    X, y = pooled_dataset(panel, targets, vix, cfg)
+
+    fitted = []
+
+    def gbm_factory(features, importance):
+        def make():
+            model = GBM(g["params"], features, g["val_days"], h, g["max_iter"],
+                        g["n_iter_no_change"], cfg["seed"], importance)
+            if importance:
+                fitted.append(model)
+            return model
+        return make
+
+    X_har = np.exp(X[["log_rv_d", "log_rv_w", "log_rv_m"]]).rename(columns=lambda c: c[4:])
+    out = pd.DataFrame({
+        "gbm": run_supervised(gbm_factory(g["features"], True), X[g["features"]], y, splits),
+        "gbm_har_feats": run_supervised(gbm_factory(g["har_only_features"], False),
+                                        X[g["har_only_features"]], y, splits),
+        "har_pooled": run_supervised(HAR, X_har, y, splits),
+    })
+
+    importances = pd.DataFrame([m.importances_ for m in fitted],
+                               index=[s.refit_date for s in splits])
+    importances.to_csv(TABLES / "gbm_permutation_importance_by_refit.csv")
+    summary = importances.agg(["mean", "std"]).T.sort_values("mean", ascending=False)
+    summary.round(5).to_csv(TABLES / "gbm_permutation_importance.csv")
+    trees = pd.Series([m.n_trees_ for m in fitted])
+    print(f"GBM trees per refit: median {trees.median():.0f}, range {trees.min()}-{trees.max()}")
+
+    for model in out.columns:
+        out[[model]].to_parquet(PREDICTIONS / f"{model}.parquet")
+    return out
+
+
 def evaluation_stage(forecasts: pd.DataFrame, targets: pd.DataFrame) -> None:
     models = list(forecasts.columns)
     sample = common_sample(forecasts, targets["target_rv"] ** 2)
@@ -111,6 +153,7 @@ def main() -> None:
     cfg = load_config()
     panel, targets = data_stage(cfg, args.force)
     forecasts = benchmark_stage(cfg, panel, targets)
+    forecasts = forecasts.join(ml_stage(cfg, panel, targets))
     evaluation_stage(forecasts, targets)
 
 

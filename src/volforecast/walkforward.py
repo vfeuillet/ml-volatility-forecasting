@@ -34,20 +34,27 @@ def make_splits(calendar: pd.DatetimeIndex, test_start: str, refit_every: int, h
     return splits
 
 
+def dates_of(index: pd.Index) -> pd.DatetimeIndex:
+    """Date component of a DatetimeIndex or of a (date, ticker) MultiIndex."""
+    return index.get_level_values(0) if isinstance(index, pd.MultiIndex) else index
+
+
 def run_supervised(model_factory: Callable, X: pd.DataFrame, y: pd.Series, splits: list[Split]) -> pd.Series:
     """Walk-forward for a model with fit(X, y) / predict(X) -> forecast variance.
 
-    X and y share the same DatetimeIndex (one ticker). Rows with missing features
-    or target are dropped from training; rows with missing features get no forecast.
+    X and y share the same index: a DatetimeIndex (one ticker) or a (date, ticker)
+    MultiIndex (pooled model). Rows with missing features or target are dropped from
+    training; rows with missing features get no forecast.
     """
-    valid_X = X.notna().all(axis=1)
-    trainable = valid_X & y.notna()
+    dates = dates_of(X.index)
+    valid_X = X.notna().all(axis=1).to_numpy()
+    trainable = valid_X & y.notna().to_numpy()
     preds = []
     for s in splits:
-        train = trainable & (X.index <= s.train_end)
+        train = trainable & (dates <= s.train_end)
         model = model_factory()
         model.fit(X[train], y[train])
-        test = X.loc[X.index.isin(s.test_dates) & valid_X]
+        test = X[dates.isin(s.test_dates) & valid_X]
         if len(test):
             preds.append(pd.Series(model.predict(test), index=test.index))
     return pd.concat(preds).rename("forecast_var") if preds else pd.Series(dtype=float, name="forecast_var")
