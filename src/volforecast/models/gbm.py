@@ -17,7 +17,7 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance
 
-from volforecast.walkforward import dates_of
+from volforecast.walkforward import dates_of, purged_holdout
 
 
 class GBM:
@@ -33,13 +33,7 @@ class GBM:
                                              **self.params, **kw)
 
     def split(self, dates: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
-        """Boolean masks (fit, validation): the last `val_days` dates validate, and the
-        fitting part stops `horizon` days earlier so that no fitting target, which
-        spans t+1..t+h, overlaps a validation target (purge)."""
-        unique = dates.unique().sort_values()
-        val_start = unique[-self.val_days]
-        fit_end = unique[len(unique) - self.val_days - self.horizon]
-        return np.asarray(dates <= fit_end), np.asarray(dates >= val_start)
+        return purged_holdout(dates, self.val_days, self.horizon)
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> "GBM":
         X = X[self.features]

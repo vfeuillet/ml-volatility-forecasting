@@ -20,7 +20,7 @@ walkforward:
   refit_every: 21            # trading days between re-estimations
 
 gbm:
-  features: [log_rv_d, log_rv_w, log_rv_m, ret_1, ret_5, ret_22, abs_ret_1, abs_ret_5,
+  features: &ml_features [log_rv_d, log_rv_w, log_rv_m, ret_1, ret_5, ret_22, abs_ret_1, abs_ret_5,
              neg_ret_1, log_park_1, log_park_5, log_vix_lag, vix_chg_5_lag,
              log_volume_ratio, log_overnight_5]
   har_only_features: [log_rv_d, log_rv_w, log_rv_m]   # ablation
@@ -41,3 +41,23 @@ gbm:
       max_leaf_nodes: [15, 31]
       min_samples_leaf: [100, 500]
       l2_regularization: [0.0, 1.0]
+
+lstm:
+  features: *ml_features     # same 15 predictors as the GBM
+  # Chosen by scripts/tune_lstm.py on 2009-2011 (val QLIKE 0.318, grid 0.318-0.330), then frozen.
+  seq_len: 22
+  hidden: 32
+  dropout: 0.1
+  lr: 0.001
+  batch_size: 512
+  max_epochs: 40
+  patience: 5
+  val_days: 252
+  seeds: [0, 1, 2]           # forecasts are averaged over seeds
+  num_threads: 8
+  tuning:
+    train_end: "2008-12-31"
+    val_end: "2011-12-31"
+    grid:
+      seq_len: [22, 60]
+      hidden: [16, 32]

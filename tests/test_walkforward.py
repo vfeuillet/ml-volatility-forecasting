@@ -48,3 +48,13 @@ def test_run_supervised_trains_only_up_to_train_end():
     for (x_max, y_max), s in zip(RecordingModel.seen, splits):
         assert x_max == s.train_end and y_max == s.train_end
     assert preds.index.min() == splits[0].refit_date
+
+
+def test_yearly_splits_start_each_january_and_purge():
+    from volforecast.walkforward import yearly_splits
+    splits = yearly_splits(CAL, "2012-01-01", H)
+    assert [s.refit_date.year for s in splits] == [2012, 2013, 2014]
+    for s in splits:
+        assert s.refit_date == CAL[CAL.year == s.refit_date.year][0]
+        assert CAL.get_loc(s.train_end) + H == CAL.get_loc(s.refit_date)
+        assert (s.test_dates.year == s.refit_date.year).all()

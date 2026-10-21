@@ -1,4 +1,9 @@
-"""End-to-end pipeline: `python scripts/run_all.py` (add --force to re-download)."""
+"""End-to-end pipeline: `python scripts/run_all.py`.
+
+--force      re-download the raw data
+--use-cache  reload model forecasts already in results/predictions instead of
+             recomputing them (development only; the default recomputes everything)
+"""
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
@@ -14,10 +19,11 @@ from volforecast.features import har_features, pooled_dataset
 from volforecast.models.gbm import GBM
 from volforecast.models.garch import garch_forecast
 from volforecast.models.har import HAR
+from volforecast.models.lstm import LSTMConfig, lstm_walkforward
 from volforecast.models.naive import naive_forecast
 from volforecast.plots import target_vs_vix
 from volforecast.targets import build_targets, variance_components
-from volforecast.walkforward import make_splits, run_supervised
+from volforecast.walkforward import make_splits, run_supervised, yearly_splits
 
 PROCESSED = PROJECT_ROOT / "data" / "processed"
 PREDICTIONS = PROJECT_ROOT / "results" / "predictions"
@@ -134,6 +140,35 @@ def ml_stage(cfg: dict, panel: dict, targets: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def lstm_stage(cfg: dict, panel: dict, targets: pd.DataFrame) -> pd.DataFrame:
+    """Pooled LSTM, refitted yearly; the forecast is the average over seeds."""
+    calendar = panel[cfg["data"]["benchmark"]].index
+    vix = load_close(cfg["data"]["vix"], cfg, calendar)
+    X, y = pooled_dataset(panel, targets, vix, cfg)
+    splits = yearly_splits(calendar, cfg["walkforward"]["test_start"], cfg["target"]["horizon"])
+    by_seed, logs = lstm_walkforward(X[cfg["lstm"]["features"]], y, splits,
+                                     LSTMConfig.from_cfg(cfg), cfg["lstm"]["seeds"])
+    logs.to_csv(TABLES / "lstm_training_log.csv", index=False)
+    by_seed.to_parquet(PREDICTIONS / "lstm_by_seed.parquet")
+    print(f"LSTM best epochs: median {logs['best_epoch'].median():.0f}, "
+          f"range {logs['best_epoch'].min()}-{logs['best_epoch'].max()}")
+    out = by_seed.mean(axis=1).rename("lstm").to_frame()
+    out.to_parquet(PREDICTIONS / "lstm.parquet")
+    return out
+
+
+def cached(name: str, compute, use_cache: bool) -> pd.DataFrame:
+    """Run a forecasting stage, or reload its saved forecasts when allowed."""
+    path = PREDICTIONS / f"{name}.parquet"
+    if use_cache and path.exists():
+        print(f"[cache] {name}")
+        return pd.read_parquet(path)
+    out = compute()
+    PREDICTIONS.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(path)
+    return out
+
+
 def evaluation_stage(forecasts: pd.DataFrame, targets: pd.DataFrame) -> None:
     models = list(forecasts.columns)
     sample = common_sample(forecasts, targets["target_rv"] ** 2)
@@ -149,11 +184,13 @@ def evaluation_stage(forecasts: pd.DataFrame, targets: pd.DataFrame) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="re-download raw data")
+    parser.add_argument("--use-cache", action="store_true", help="reload saved forecasts")
     args = parser.parse_args()
     cfg = load_config()
     panel, targets = data_stage(cfg, args.force)
-    forecasts = benchmark_stage(cfg, panel, targets)
-    forecasts = forecasts.join(ml_stage(cfg, panel, targets))
+    forecasts = cached("stage_benchmarks", lambda: benchmark_stage(cfg, panel, targets), args.use_cache)
+    forecasts = forecasts.join(cached("stage_ml", lambda: ml_stage(cfg, panel, targets), args.use_cache))
+    forecasts = forecasts.join(cached("stage_lstm", lambda: lstm_stage(cfg, panel, targets), args.use_cache))
     evaluation_stage(forecasts, targets)
 
 

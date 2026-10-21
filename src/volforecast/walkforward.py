@@ -10,6 +10,7 @@ At each refit date T (information set: closes up to and including T):
 from dataclasses import dataclass
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 
 
@@ -32,6 +33,45 @@ def make_splits(calendar: pd.DatetimeIndex, test_start: str, refit_every: int, h
             test_dates=calendar[pos:pos + refit_every],
         ))
     return splits
+
+
+def yearly_splits(calendar: pd.DatetimeIndex, test_start: str, horizon: int) -> list[Split]:
+    """One refit on the first trading day of each year from `test_start` on."""
+    test = calendar[calendar >= pd.Timestamp(test_start)]
+    firsts = pd.Series(test, index=test).groupby(test.year).first()
+    splits = []
+    for i, refit in enumerate(firsts):
+        pos = calendar.get_loc(refit)
+        end = calendar.get_loc(firsts.iloc[i + 1]) if i + 1 < len(firsts) else len(calendar)
+        splits.append(Split(refit_date=refit, train_end=calendar[pos - horizon],
+                            test_dates=calendar[pos:end]))
+    return splits
+
+
+def purged_holdout(dates: pd.DatetimeIndex, val_days: int, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+    """Boolean masks (fit, validation) inside a training window.
+
+    The last `val_days` dates validate; the fitting part stops `horizon` days
+    earlier so that no fitting target (t+1..t+h) overlaps a validation target.
+    """
+    unique = dates.unique().sort_values()
+    val_start = unique[-val_days]
+    fit_end = unique[len(unique) - val_days - horizon]
+    return np.asarray(dates <= fit_end), np.asarray(dates >= val_start)
+
+
+def tuning_masks(dates: pd.DatetimeIndex, calendar: pd.DatetimeIndex, horizon: int,
+                 train_end: str, val_end: str) -> tuple[np.ndarray, np.ndarray]:
+    """Purged (train, validation) masks for hyperparameter selection before the test.
+
+    Training targets end by the first validation origin; validation targets end by
+    the last trading day of `val_end`, i.e. before the first test origin.
+    """
+    cal = calendar[calendar <= pd.Timestamp(val_end)]
+    val_first = cal[cal.searchsorted(pd.Timestamp(train_end), side="right")]
+    train = dates <= cal[cal.get_loc(val_first) - horizon]
+    val = (dates >= val_first) & (dates <= cal[-1 - horizon])
+    return np.asarray(train), np.asarray(val)
 
 
 def dates_of(index: pd.Index) -> pd.DatetimeIndex:

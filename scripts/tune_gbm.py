@@ -16,7 +16,7 @@ from volforecast.evaluation import qlike
 from volforecast.features import pooled_dataset
 from volforecast.models.gbm import GBM
 from volforecast.targets import build_targets
-from volforecast.walkforward import dates_of
+from volforecast.walkforward import dates_of, tuning_masks
 
 
 def main() -> None:
@@ -30,13 +30,7 @@ def main() -> None:
     ok = X[g["features"]].notna().all(axis=1) & y.notna()
     X, y = X[ok], y[ok]
 
-    dates = dates_of(X.index)
-    cal = calendar[calendar <= tun["val_end"]]
-    # Purged split: training targets end by the first validation origin; validation
-    # targets end by the last trading day of 2011.
-    val_first = cal[cal.searchsorted(pd.Timestamp(tun["train_end"]), side="right")]
-    train = dates <= cal[cal.get_loc(val_first) - h]
-    val = (dates >= val_first) & (dates <= cal[-1 - h])
+    train, val = tuning_masks(dates_of(X.index), calendar, h, tun["train_end"], tun["val_end"])
     realized = np.exp(2 * y[val])  # y is log RV, so this is RV^2
 
     grid = tun["grid"]
