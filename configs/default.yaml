@@ -61,3 +61,14 @@ lstm:
     grid:
       seq_len: [22, 60]
       hidden: [16, 32]
+
+evaluation:
+  # harx_ticker / harx_pooled were specified as controls before any of them was run.
+  main_models: [naive, garch, gjr, har, harx_ticker, gbm, lstm]
+  ablation_models: [har, har_pooled, harx_ticker, harx_pooled, gbm_har_feats, gbm, lstm]
+  dm_references: [har, garch, harx_ticker]
+  regimes:
+    full: ["2012-01-01", "2025-12-31"]
+    calm_2015_2019: ["2015-01-01", "2019-12-31"]
+    covid_2020: ["2020-01-01", "2020-12-31"]
+    inflation_2022: ["2022-01-01", "2022-12-31"]

@@ -28,3 +28,26 @@ class HAR:
     def _design(X: pd.DataFrame) -> np.ndarray:
         logs = np.log(X[FEATURES].to_numpy())
         return np.column_stack([np.ones(len(X)), logs])
+
+
+class LinearLogVol:
+    """HAR-X: OLS of log RV on an arbitrary set of (already transformed) predictors.
+
+    Used as a control for the ML models: same information set, linear form.
+    Same log-normal bias correction as HAR.
+    """
+
+    def __init__(self, features: list[str]):
+        self.features = features
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "LinearLogVol":
+        Z = self._design(X)
+        self.coef_, *_ = np.linalg.lstsq(Z, y.to_numpy(), rcond=None)
+        self.resid_var_ = (y.to_numpy() - Z @ self.coef_).var(ddof=Z.shape[1])
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return np.exp(2 * self._design(X) @ self.coef_ + 2 * self.resid_var_)
+
+    def _design(self, X: pd.DataFrame) -> np.ndarray:
+        return np.column_stack([np.ones(len(X)), X[self.features].to_numpy()])

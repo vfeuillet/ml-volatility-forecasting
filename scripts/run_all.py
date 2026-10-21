@@ -14,14 +14,16 @@ import pandas as pd
 
 from volforecast.config import PROJECT_ROOT, load_config
 from volforecast.data import load_close, load_universe
-from volforecast.evaluation import common_sample, metrics_by_ticker, universe_summary
+from volforecast.evaluation import (common_sample, dm_table, metrics_by_ticker, qlike,
+                                   regime_table, to_markdown, universe_summary)
 from volforecast.features import har_features, pooled_dataset
 from volforecast.models.gbm import GBM
 from volforecast.models.garch import garch_forecast
-from volforecast.models.har import HAR
+from volforecast.models.har import HAR, LinearLogVol
 from volforecast.models.lstm import LSTMConfig, lstm_walkforward
 from volforecast.models.naive import naive_forecast
-from volforecast.plots import target_vs_vix
+from volforecast.plots import (cumulative_loss_difference, feature_importance,
+                              forecasts_vs_realized, target_vs_vix)
 from volforecast.targets import build_targets, variance_components
 from volforecast.walkforward import make_splits, run_supervised, yearly_splits
 
@@ -169,16 +171,81 @@ def cached(name: str, compute, use_cache: bool) -> pd.DataFrame:
     return out
 
 
-def evaluation_stage(forecasts: pd.DataFrame, targets: pd.DataFrame) -> None:
-    models = list(forecasts.columns)
-    sample = common_sample(forecasts, targets["target_rv"] ** 2)
-    by_ticker = metrics_by_ticker(sample, models)
-    summary = universe_summary(by_ticker)
-    by_ticker.round(5).to_csv(TABLES / "metrics_by_ticker.csv")
-    summary.round(4).to_csv(TABLES / "metrics_universe.csv")
+def harx_stage(cfg: dict, panel: dict, targets: pd.DataFrame) -> pd.DataFrame:
+    """HAR-X control: linear model on the ML feature set, pooled and per ticker."""
+    calendar = panel[cfg["data"]["benchmark"]].index
+    vix = load_close(cfg["data"]["vix"], cfg, calendar)
+    w, h, feats = cfg["walkforward"], cfg["target"]["horizon"], cfg["gbm"]["features"]
+    splits = make_splits(calendar, w["test_start"], w["refit_every"], h)
+    X, y = pooled_dataset(panel, targets, vix, cfg)
+    X = X[feats]
+    per_ticker = [run_supervised(lambda: LinearLogVol(feats), X.xs(tk, level="ticker"),
+                                 y.xs(tk, level="ticker"), splits).to_frame().assign(ticker=tk)
+                  for tk in panel]
+    return pd.DataFrame({
+        "harx_pooled": run_supervised(lambda: LinearLogVol(feats), X, y, splits),
+        "harx_ticker": pd.concat(per_ticker).set_index("ticker", append=True)["forecast_var"],
+    })
+
+
+def evaluation_stage(cfg: dict, forecasts: pd.DataFrame, targets: pd.DataFrame) -> None:
+    ev, h = cfg["evaluation"], cfg["target"]["horizon"]
+    main, ablation = ev["main_models"], ev["ablation_models"]
+    models = list(dict.fromkeys(main + ablation))
+    sample = common_sample(forecasts[models], targets["target_rv"] ** 2)
     dates = sample.index.get_level_values("date")
     print(f"\nCommon sample: {dates.min().date()} to {dates.max().date()}, {len(sample)} obs")
-    print(summary.round(4).to_string())
+
+    # Point metrics.
+    by_ticker = metrics_by_ticker(sample, models)
+    by_ticker.round(5).to_csv(TABLES / "metrics_by_ticker.csv")
+    summary = universe_summary(by_ticker)
+    summary.round(4).to_csv(TABLES / "metrics_universe.csv")
+
+    # Diebold-Mariano (QLIKE and MSE) against HAR and GARCH.
+    dm = pd.concat([dm_table(sample, main, ev["dm_references"], h, loss) for loss in ("qlike", "mse")])
+    dm.round(4).to_csv(TABLES / "diebold_mariano.csv", index=False)
+
+    # Regimes.
+    regimes = regime_table(sample, main, ev["regimes"], h)
+    regimes.round(4).to_csv(TABLES / "regimes.csv", index=False)
+
+    # Markdown versions for the README.
+    cols = ["qlike", "mse_var", "mae_vol", "mz_beta", "mz_r2", "qlike_vs_har", "pct_tickers_beat_har"]
+    def dm_cells(loss):
+        d = dm[dm["loss"] == loss]
+        cell = d.apply(lambda r: f"p={r.universe_p_value:.3f} ({r.n_tickers_better}+ / "
+                                 f"{r.n_tickers_worse}-)", axis=1)
+        return d.assign(cell=cell).pivot(index="model", columns="reference", values="cell") \
+                .reindex(main).fillna("—").add_prefix("vs ")
+
+    reg = regimes.assign(cell=regimes.apply(
+        lambda r: f"{r.qlike_vs_har:.3f}" + ("" if r.model == "har" else f" (p={r.dm_p_value:.3f})"), axis=1))
+    md = {
+        "Main results (ticker-averaged)": summary.loc[main, cols].sort_values("qlike"),
+        "Ablations": summary.loc[ablation, cols].sort_values("qlike"),
+        "Diebold-Mariano on QLIKE (universe p-value; tickers significantly better+ / worse-)": dm_cells("qlike"),
+        "Diebold-Mariano on MSE": dm_cells("mse"),
+        "QLIKE ratio to HAR by regime (universe DM p-value vs HAR)": reg.pivot(
+            index="model", columns="regime", values="cell").loc[main, list(ev["regimes"])],
+    }
+    text = "\n\n".join(f"### {k}\n\n{to_markdown(v)}" for k, v in md.items())
+    (TABLES / "results.md").write_text(text + "\n")
+    print(text)
+
+    # Figures.
+    spy = sample.xs(cfg["data"]["benchmark"], level="ticker")
+    forecasts_vs_realized(spy, ["har", "lstm"], "SPY — 5-day realized vol vs forecasts, 2012–2025",
+                          FIGURES / "spy_forecasts_full.png")
+    forecasts_vs_realized(spy.loc["2020-01-01":"2020-12-31"], ["garch", "har", "harx_ticker", "lstm"],
+                          "SPY — 5-day realized vol vs forecasts, 2020",
+                          FIGURES / "spy_forecasts_2020.png")
+    losses = pd.DataFrame({m: qlike(sample["realized"].to_numpy(), sample[m].to_numpy())
+                           for m in main}, index=sample.index).groupby(level="date").mean()
+    diff = losses[[m for m in main if m not in ("har", "naive")]].sub(losses["har"], axis=0)
+    cumulative_loss_difference(diff, FIGURES / "cumulative_qlike_vs_har.png")
+    feature_importance(pd.read_csv(TABLES / "gbm_permutation_importance.csv", index_col=0),
+                       FIGURES / "gbm_feature_importance.png")
 
 
 def main() -> None:
@@ -191,7 +258,8 @@ def main() -> None:
     forecasts = cached("stage_benchmarks", lambda: benchmark_stage(cfg, panel, targets), args.use_cache)
     forecasts = forecasts.join(cached("stage_ml", lambda: ml_stage(cfg, panel, targets), args.use_cache))
     forecasts = forecasts.join(cached("stage_lstm", lambda: lstm_stage(cfg, panel, targets), args.use_cache))
-    evaluation_stage(forecasts, targets)
+    forecasts = forecasts.join(cached("stage_harx", lambda: harx_stage(cfg, panel, targets), args.use_cache))
+    evaluation_stage(cfg, forecasts, targets)
 
 
 if __name__ == "__main__":

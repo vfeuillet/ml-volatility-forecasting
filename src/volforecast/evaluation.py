@@ -8,6 +8,7 @@ ranking as with the true variance in expectation.
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 
 def qlike(realized: np.ndarray, forecast: np.ndarray) -> np.ndarray:
@@ -66,3 +67,108 @@ def universe_summary(by_ticker: pd.DataFrame, reference: str = "har") -> pd.Data
     q = by_ticker["qlike"].unstack("model")
     avg[f"pct_tickers_beat_{reference}"] = 100 * (q.lt(q[reference], axis=0)).mean()
     return avg.drop(columns="n_obs").sort_values("qlike")
+
+
+# --- Diebold-Mariano -------------------------------------------------------------
+
+def newey_west_lags(n: int, horizon: int) -> int:
+    """Bartlett bandwidth floor(sqrt(n)), and at least h-1.
+
+    Overlapping h-day targets make the loss differential at least MA(h-1), and
+    volatility clustering adds persistence on top. In simulations (MA(4) plus a
+    persistent AR(1) component, see tests/test_evaluation.py) the textbook rule
+    4 (n/100)^(2/9) rejects a true null 20-30% of the time at the 5% level, while
+    sqrt(n) keeps the size around 5-8% for n >= 1000. With n ~ 250 (one-year
+    regimes) no bandwidth is reliable: those p-values are indicative only.
+    """
+    return max(horizon - 1, int(np.floor(np.sqrt(n))))
+
+
+def long_run_variance(d: np.ndarray, lags: int) -> float:
+    """Newey-West (Bartlett kernel) estimate of the long-run variance of d."""
+    d = d - d.mean()
+    n = len(d)
+    lrv = d @ d / n
+    for k in range(1, lags + 1):
+        lrv += 2 * (1 - k / (lags + 1)) * (d[k:] @ d[:-k]) / n
+    return lrv
+
+
+def diebold_mariano(loss_model: np.ndarray, loss_ref: np.ndarray, horizon: int) -> dict:
+    """DM test of equal predictive accuracy, with the Harvey-Leybourne-Newbold (1997)
+    small-sample correction and Student-t(n-1) p-values (two-sided).
+
+    d = loss_model - loss_ref: a negative statistic means the model beats the reference.
+    """
+    d = np.asarray(loss_model, float) - np.asarray(loss_ref, float)
+    n = len(d)
+    lags = newey_west_lags(n, horizon)
+    dm = d.mean() / np.sqrt(long_run_variance(d, lags) / n)
+    hln = np.sqrt((n + 1 - 2 * horizon + horizon * (horizon - 1) / n) / n)
+    stat = dm * hln
+    return {"mean_diff": d.mean(), "dm_stat": stat,
+            "p_value": 2 * stats.t.sf(abs(stat), df=n - 1), "n_obs": n, "lags": lags}
+
+
+LOSSES = {"qlike": qlike, "mse": squared_error}
+
+
+def dm_table(sample: pd.DataFrame, models: list[str], references: list[str], horizon: int,
+             loss: str = "qlike", alpha: float = 0.05) -> pd.DataFrame:
+    """DM tests of each model against each reference.
+
+    - universe: one test on the cross-sectional average loss differential per date,
+      which accounts for the strong cross-correlation between tickers;
+    - per ticker: number of tickers where the model is significantly better / worse.
+    """
+    f = LOSSES[loss]
+    realized = sample["realized"].to_numpy()
+    losses = pd.DataFrame({m: f(realized, sample[m].to_numpy()) for m in set(models) | set(references)},
+                          index=sample.index)
+    rows = []
+    for ref in references:
+        for m in models:
+            if m == ref:
+                continue
+            diff = (losses[m] - losses[ref])
+            daily = diff.groupby(level="date").mean().to_numpy()
+            uni = diebold_mariano(daily, np.zeros_like(daily), horizon)
+            better = worse = 0
+            for _, g in diff.groupby(level="ticker"):
+                r = diebold_mariano(g.to_numpy(), np.zeros(len(g)), horizon)
+                better += (r["p_value"] < alpha) and r["dm_stat"] < 0
+                worse += (r["p_value"] < alpha) and r["dm_stat"] > 0
+            rows.append({"model": m, "reference": ref, "loss": loss,
+                         "universe_dm_stat": uni["dm_stat"], "universe_p_value": uni["p_value"],
+                         "n_tickers_better": better, "n_tickers_worse": worse,
+                         "n_tickers": diff.index.get_level_values("ticker").nunique()})
+    return pd.DataFrame(rows)
+
+
+# --- Regimes and reporting --------------------------------------------------------
+
+def regime_table(sample: pd.DataFrame, models: list[str], regimes: dict, horizon: int,
+                 reference: str = "har") -> pd.DataFrame:
+    """Ticker-averaged QLIKE per regime, with the universe DM test against `reference`."""
+    dates = sample.index.get_level_values("date")
+    rows = []
+    for name, (start, end) in regimes.items():
+        sub = sample[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
+        q = metrics_by_ticker(sub, models)["qlike"].unstack("model").mean()
+        dm = dm_table(sub, models, [reference], horizon).set_index("model")
+        for m in models:
+            rows.append({"regime": name, "model": m, "qlike": q[m],
+                         f"qlike_vs_{reference}": q[m] / q[reference],
+                         "dm_p_value": dm["universe_p_value"].get(m, np.nan),
+                         "n_days": sub.index.get_level_values("date").nunique()})
+    return pd.DataFrame(rows)
+
+
+def to_markdown(df: pd.DataFrame, floatfmt: str = "{:.3f}") -> str:
+    """Minimal GitHub-flavoured markdown table (avoids a `tabulate` dependency)."""
+    df = df.reset_index()
+    cells = [[floatfmt.format(v) if isinstance(v, (float, np.floating)) else str(v) for v in row]
+             for row in df.itertuples(index=False)]
+    header = "| " + " | ".join(map(str, df.columns)) + " |"
+    sep = "|" + "|".join("---" for _ in df.columns) + "|"
+    return "\n".join([header, sep] + ["| " + " | ".join(r) + " |" for r in cells])

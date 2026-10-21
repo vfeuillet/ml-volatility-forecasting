@@ -53,3 +53,15 @@ def test_garch_covers_all_test_dates():
     expected = pd.DatetimeIndex(np.concatenate([s.test_dates.values for s in splits]))
     assert fc.index.equals(expected)
     assert (fc > 0).all() and n_failed == 0
+
+
+def test_harx_recovers_known_coefficients():
+    from volforecast.models.har import LinearLogVol
+    rng = np.random.default_rng(3)
+    n = 20_000
+    X = pd.DataFrame(rng.normal(size=(n, 3)), columns=["a", "b", "c"])
+    beta = np.array([-1.5, 0.4, -0.2, 0.0])
+    y = pd.Series(beta[0] + X.to_numpy() @ beta[1:] + rng.normal(0, 0.3, n))
+    m = LinearLogVol(["a", "b", "c"]).fit(X, y)
+    np.testing.assert_allclose(m.coef_, beta, atol=0.01)
+    assert np.mean(np.exp(2 * y)) / np.mean(m.predict(X)) == pytest.approx(1.0, abs=0.03)
