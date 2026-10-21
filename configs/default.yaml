@@ -72,3 +72,10 @@ evaluation:
     calm_2015_2019: ["2015-01-01", "2019-12-31"]
     covid_2020: ["2020-01-01", "2020-12-31"]
     inflation_2022: ["2022-01-01", "2022-12-31"]
+
+backtest:
+  asset: SPY
+  target_vol: 0.10
+  max_leverage: 2.0
+  cost_bps: 5                # per unit of turnover
+  strategies: [naive, garch, gjr, har, harx_ticker, gbm, lstm]

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import matplotlib
 import matplotlib.dates
+import matplotlib.ticker
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -113,4 +114,28 @@ def feature_importance(imp: pd.DataFrame, path: Path) -> None:
                   color=INK_2, fontsize=9)
     ax.set_title("Gradient boosting — permutation importance (mean ± sd over 168 refits)",
                  loc="left", color=INK, fontsize=11)
+    _save(fig, path)
+
+
+def backtest_nav(navs: pd.DataFrame, path: Path) -> None:
+    """Growth of $1 (log scale) for vol-targeting strategies and buy-and-hold."""
+    fig, ax = plt.subplots(figsize=(11, 4.8), facecolor=SURFACE)
+    _style(ax)
+    for col in navs.columns:
+        color = MODEL_COLORS.get(col, GRID_DARK)
+        style = "--" if col == "oracle" else "-"
+        label = {"buy_hold": "SPY buy-and-hold",
+                 "bh_matched": "SPY buy-and-hold scaled to the HAR strategy's vol (ex post)",
+                 "oracle": "Oracle (realized vol, infeasible)"}.get(
+            col, MODEL_LABELS.get(col, col))
+        ax.plot(navs.index, navs[col], color=INK if col == "oracle" else color, linestyle=style,
+                linewidth=1.2 if col in ("buy_hold", "bh_matched", "oracle") else 1.6, label=label)
+    ax.set_yscale("log")
+    ax.yaxis.set_major_locator(matplotlib.ticker.FixedLocator([1, 1.5, 2, 3, 4, 6, 8]))
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    ax.set_ylabel("Growth of $1 (log scale)", color=INK_2, fontsize=9)
+    ax.set_title("SPY volatility targeting (10% target, leverage ≤ 2, 5 bp costs, weekly)",
+                 loc="left", color=INK, fontsize=11)
+    ax.legend(frameon=False, fontsize=9, labelcolor=INK_2, loc="upper left")
     _save(fig, path)

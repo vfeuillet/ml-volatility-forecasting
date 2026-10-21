@@ -12,6 +12,7 @@ from functools import partial
 import numpy as np
 import pandas as pd
 
+from volforecast.backtest import performance, run_backtest, target_weights, weekly_rebalance_dates
 from volforecast.config import PROJECT_ROOT, load_config
 from volforecast.data import load_close, load_universe
 from volforecast.evaluation import (common_sample, dm_table, metrics_by_ticker, qlike,
@@ -22,7 +23,7 @@ from volforecast.models.garch import garch_forecast
 from volforecast.models.har import HAR, LinearLogVol
 from volforecast.models.lstm import LSTMConfig, lstm_walkforward
 from volforecast.models.naive import naive_forecast
-from volforecast.plots import (cumulative_loss_difference, feature_importance,
+from volforecast.plots import (backtest_nav, cumulative_loss_difference, feature_importance,
                               forecasts_vs_realized, target_vs_vix)
 from volforecast.targets import build_targets, variance_components
 from volforecast.walkforward import make_splits, run_supervised, yearly_splits
@@ -248,6 +249,60 @@ def evaluation_stage(cfg: dict, forecasts: pd.DataFrame, targets: pd.DataFrame) 
                        FIGURES / "gbm_feature_importance.png")
 
 
+def backtest_stage(cfg: dict, panel: dict, forecasts: pd.DataFrame, targets: pd.DataFrame) -> None:
+    b = cfg["backtest"]
+    asset = panel[b["asset"]]
+    calendar = asset.index
+    ret = asset["close"].pct_change()  # adjusted close: total return
+    irx = load_close(cfg["data"]["risk_free"], cfg, calendar).ffill()
+    rf = (irx / 100 / 252).shift(1)    # yesterday's T-bill rate accrues today
+
+    fc = forecasts.xs(b["asset"], level="ticker")
+    vols = {m: np.sqrt(fc[m]) for m in b["strategies"]}
+    # Oracle: the realized vol of the coming week, known in advance (infeasible).
+    # Shifted so that the value read on R-1 is the realized vol over R+1..R+5.
+    vols["oracle"] = targets.xs(b["asset"], level="ticker")["target_rv"].shift(-1)
+
+    # Same period for every strategy: rebalancing dates where every signal exists.
+    rebal = weekly_rebalance_dates(calendar)
+    weights = {k: target_weights(v, rebal, calendar, b["target_vol"], b["max_leverage"])
+               for k, v in vols.items()}
+    common = sorted(set.intersection(*(set(w.index) for w in weights.values())))
+    start, end = common[0], common[-1]
+    weights = {k: w.loc[start:end] for k, w in weights.items()}
+    ret, rf = ret.loc[:end], rf.loc[:end]
+
+    results, navs = {}, {}
+    bh = run_backtest(ret, rf, pd.Series(1.0, index=[start]), b["cost_bps"])
+    results["buy_hold"], navs["buy_hold"] = performance(bh, rf), bh["nav"]
+    for name, w in weights.items():
+        bt = run_backtest(ret, rf, w, b["cost_bps"])
+        results[name], navs[name] = performance(bt, rf), bt["nav"]
+        # Buy-and-hold scaled (ex post) to the same realized vol, rebalanced weekly
+        # at a constant weight with the same costs: a fair, if hindsight, benchmark.
+        k = results[name]["ann_vol"] / results["buy_hold"]["ann_vol"]
+        matched = run_backtest(ret, rf, pd.Series(k, index=w.index), b["cost_bps"])
+        perf = performance(matched, rf)
+        if name == "har":
+            navs["bh_matched"] = matched["nav"]
+        results[name].update({"bh_matched_weight": k, "bh_matched_return": perf["ann_return"],
+                              "bh_matched_sharpe": perf["sharpe"],
+                              "bh_matched_max_dd": perf["max_drawdown"]})
+
+    table = pd.DataFrame(results).T
+    table.round(4).to_csv(TABLES / "backtest.csv")
+    print(f"\nBacktest {start.date()} to {end.date()}")
+    print(table.round(3).to_string())
+    cols = ["ann_return", "ann_vol", "sharpe", "sharpe_se", "max_drawdown", "turnover_per_year",
+            "avg_weight", "bh_matched_return", "bh_matched_sharpe", "bh_matched_max_dd"]
+    order = ["buy_hold"] + b["strategies"] + ["oracle"]
+    with open(TABLES / "results.md", "a") as f:
+        f.write(f"\n### Volatility targeting on SPY ({start.date()} to {end.date()})\n\n"
+                f"{to_markdown(table.loc[order, cols])}\n")
+    backtest_nav(pd.DataFrame(navs)[["bh_matched", "har", "garch", "harx_ticker", "lstm"]],
+                 FIGURES / "backtest_nav.png")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="re-download raw data")
@@ -260,6 +315,7 @@ def main() -> None:
     forecasts = forecasts.join(cached("stage_lstm", lambda: lstm_stage(cfg, panel, targets), args.use_cache))
     forecasts = forecasts.join(cached("stage_harx", lambda: harx_stage(cfg, panel, targets), args.use_cache))
     evaluation_stage(cfg, forecasts, targets)
+    backtest_stage(cfg, panel, forecasts, targets)
 
 
 if __name__ == "__main__":
