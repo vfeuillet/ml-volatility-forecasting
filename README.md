@@ -293,6 +293,19 @@ Most of the runtime is spent in the gradient boosting and LSTM walk-forwards. A 
 run from an empty cache reproduces every table in `reports/tables/` bit for bit (fixed
 seeds, deterministic PyTorch).
 
+## How this project was built
+
+This project was built as a learning exercise in financial econometrics with an AI coding
+assistant (Claude Code). The working rules are in [`BRIEF.md`](BRIEF.md), in French:
+- proceed phase by phase (data, benchmarks, gradient boosting, LSTM, evaluation, backtest,
+  report);
+- validate a short plan before any code is written;
+- be able to explain every line;
+- report results honestly, with no tuning on the test period;
+- at the end of each phase, review the key concepts and the likely interview questions.
+
+The git history has one commit per validated phase.
+
 ## Repository structure
 
 ```
